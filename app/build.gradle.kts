@@ -71,4 +71,5 @@ dependencies {
     
     // Official Google LiteRT-LM dependency (Latest Stable)
     implementation("com.google.ai.edge.litertlm:litertlm-android:0.11.0") 
+    implementation("org.tensorflow:tensorflow-lite-task-text:0.4.4")
 }

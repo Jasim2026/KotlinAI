@@ -39,6 +39,8 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+import org.tensorflow.lite.task.core.BaseOptions
+import org.tensorflow.lite.task.text.embedder.TextEmbedder
 import java.io.File
 import java.io.FileOutputStream
 import java.io.FileReader
@@ -142,7 +144,9 @@ class ChatViewModel : ViewModel() {
 
     private var mainEngine: Engine? = null
     private var mainConversation: Conversation? = null
-    private var embeddingEngine: Engine? = null
+    
+    // Using the correct TensorFlow Lite Task Library TextEmbedder for Embedding Models
+    private var textEmbedder: TextEmbedder? = null
     
     private val vectorDB = LocalVectorDB()
     private var isVectorDBLoaded = false
@@ -158,19 +162,18 @@ class ChatViewModel : ViewModel() {
                 !embedFile.exists() || embedFile.length() == 0L -> _modelState.value = ModelState.NEEDS_EMBEDDING_MODEL
                 !faissFile.exists() || faissFile.length() == 0L -> _modelState.value = ModelState.NEEDS_FAISS_DB
                 else -> {
-                    // All files exist, load DB if not already loaded, then initialize engines
                     if (!isVectorDBLoaded) {
                         _modelState.value = ModelState.LOADING_DB
                         try {
                             vectorDB.loadFromFile(faissFile)
                             isVectorDBLoaded = true
                             initializeEngines(mainFile.absolutePath, embedFile.absolutePath)
-                        } catch (e: Throwable) { // Changed to Throwable to catch OutOfMemoryError
+                        } catch (e: Throwable) { 
                             _errorMessage.value = "Failed to load Faiss DB: ${e.message}"
                             _modelState.value = ModelState.ERROR
                         }
                     } else {
-                        if (mainEngine == null || embeddingEngine == null) {
+                        if (mainEngine == null || textEmbedder == null) {
                             initializeEngines(mainFile.absolutePath, embedFile.absolutePath)
                         } else {
                             _modelState.value = ModelState.READY
@@ -192,7 +195,7 @@ class ChatViewModel : ViewModel() {
                     }
                 }
                 checkState(context)
-            } catch (e: Throwable) { // Changed to Throwable to catch OutOfMemoryError
+            } catch (e: Throwable) { 
                 if (targetFile.exists()) targetFile.delete()
                 _errorMessage.value = e.message ?: "Failed to copy file"
                 _modelState.value = ModelState.ERROR
@@ -202,24 +205,29 @@ class ChatViewModel : ViewModel() {
 
     private fun initializeEngines(mainPath: String, embedPath: String) {
         try {
+            // 1. Initialize Main LLM natively for Text Generation
             Engine.setNativeMinLogSeverity(LogSeverity.ERROR)
-            
             mainEngine = Engine(EngineConfig(modelPath = mainPath))
             mainEngine?.initialize()
             mainConversation = mainEngine?.createConversation()
             
-            embeddingEngine = Engine(EngineConfig(modelPath = embedPath))
-            embeddingEngine?.initialize()
+            // 2. Initialize TextEmbedder natively for Dense Vector Embedding Extraction
+            val baseOptions = BaseOptions.builder().build()
+            val embedderOptions = TextEmbedder.TextEmbedderOptions.builder()
+                .setBaseOptions(baseOptions)
+                .build()
+                
+            textEmbedder = TextEmbedder.createFromFileAndOptions(File(embedPath), embedderOptions)
             
             _messages.value = listOf(
                 ChatMessage(
-                    text = "Agentic RAG System ready.\nMain Model, Embedding Model, and Faiss DB loaded securely.",
+                    text = "Agentic RAG System ready.\nMain Model, TextEmbedder, and JSON Vector DB loaded securely.",
                     isFromUser = false
                 )
             )
             _modelState.value = ModelState.READY
         } catch (e: Exception) {
-            _errorMessage.value = e.message ?: "Failed to initialize LiteRT Engines"
+            _errorMessage.value = e.message ?: "Failed to initialize Edge AI engines"
             _modelState.value = ModelState.ERROR
         }
     }
@@ -233,7 +241,6 @@ class ChatViewModel : ViewModel() {
 
         viewModelScope.launch(Dispatchers.IO) {
             try {
-                // 1. Agentic Evaluation
                 updateLastBotMessage("Agent is deciding if RAG is needed...", isLoading = true)
                 val agentPrompt = """
                     System: You are an intelligent routing agent. Decide if external knowledge is required to answer the user query accurately.
@@ -247,12 +254,10 @@ class ChatViewModel : ViewModel() {
                 if (needsRag) {
                     updateLastBotMessage("Agent routing... Searching local Vector DB...", isLoading = true)
                     
-                    // 2. Generate Embedding & Search
                     val queryEmbedding = generateEmbedding(text)
                     val contextTexts = vectorDB.search(queryEmbedding, topK = 3)
                     val combinedContext = contextTexts.joinToString("\n\n")
                     
-                    // 3. Generate Final Contextual Answer
                     updateLastBotMessage("Context found. Generating final answer...", isLoading = true)
                     val ragPrompt = """
                         System: Use the following context to answer the user's question accurately.
@@ -292,35 +297,23 @@ class ChatViewModel : ViewModel() {
         updateLastBotMessage(fullResponse, isLoading = false)
     }
 
-    private suspend fun generateEmbedding(text: String): FloatArray {
-        val tempConv = embeddingEngine?.createConversation() ?: throw IllegalStateException("Embedding Engine not ready")
-        var output = ""
-        try {
-            tempConv.sendMessageAsync(text).collect { token -> output += token }
-        } catch (e: Exception) {
-            // Fallback to deterministic pseudo-embedding if native engine fails text-to-float format
-        } finally {
-            tempConv.close()
-        }
+    private fun generateEmbedding(text: String): FloatArray {
+        val embedder = textEmbedder ?: throw IllegalStateException("TextEmbedder not initialized")
+        val results = embedder.embed(text)
         
-        // Simulating the embedding array mechanically so RAG pipeline demonstrably operates 
-        val vector = FloatArray(256)
-        val random = java.util.Random(text.hashCode().toLong())
-        for (i in 0 until 256) {
-            vector[i] = random.nextFloat()
-        }
-        return vector
+        return results.embeddings.firstOrNull()?.floatArray 
+            ?: throw IllegalStateException("TextEmbedder failed to return a valid float array")
     }
 
     fun resetModel(context: Context) {
         viewModelScope.launch(Dispatchers.IO) {
             mainConversation?.close()
             mainEngine?.close()
-            embeddingEngine?.close()
+            textEmbedder?.close()
             
             mainEngine = null
             mainConversation = null
-            embeddingEngine = null
+            textEmbedder = null
             
             File(context.filesDir, "main_model.litertlm").delete()
             File(context.filesDir, "embedding_model.litertlm").delete()
@@ -348,7 +341,7 @@ class ChatViewModel : ViewModel() {
         super.onCleared()
         mainConversation?.close()
         mainEngine?.close()
-        embeddingEngine?.close()
+        textEmbedder?.close()
     }
 }
 
