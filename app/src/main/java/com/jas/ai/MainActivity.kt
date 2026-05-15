@@ -24,6 +24,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
@@ -45,10 +46,16 @@ import java.io.FileOutputStream
 import java.io.FileReader
 import java.util.UUID
 
+/**
+ * MODELS STATE
+ */
 enum class ModelState { CHECKING, NEEDS_MAIN_MODEL, NEEDS_EMBEDDING_MODEL, NEEDS_FAISS_DB, LOADING_DB, COPYING, READY, ERROR }
 
 data class ChatMessage(val id: String = UUID.randomUUID().toString(), val text: String, val isFromUser: Boolean, val isLoading: Boolean = false)
 
+/**
+ * VECTOR SEARCH ENGINE WITH KEYWORD FALLBACK
+ */
 class LocalVectorDB {
     data class Record(val text: String, val vector: FloatArray)
     private val records = mutableListOf<Record>()
@@ -106,6 +113,9 @@ class LocalVectorDB {
     fun clear() = records.clear()
 }
 
+/**
+ * VIEWMODEL
+ */
 class ChatViewModel : ViewModel() {
     private val _messages = MutableStateFlow<List<ChatMessage>>(emptyList())
     val messages: StateFlow<List<ChatMessage>> = _messages.asStateFlow()
@@ -144,8 +154,7 @@ class ChatViewModel : ViewModel() {
             try {
                 context.contentResolver.openInputStream(uri)?.use { input ->
                     FileOutputStream(File(context.filesDir, name)).use { output ->
-                        // FIX: use copyTo() to stream the data instead of readBytes() which uses huge RAM
-                        input.copyTo(output)
+                        input.copyTo(output) // SAFE STREAMING COPY
                     }
                 }
                 checkState(context)
@@ -173,7 +182,7 @@ class ChatViewModel : ViewModel() {
                 useKeywordFallback = true
             }
 
-            _messages.value = listOf(ChatMessage(text = "System Ready.", isFromUser = false))
+            _messages.value = listOf(ChatMessage(text = "System Ready. Mode: ${if(useKeywordFallback) "Keyword" else "Neural"}", isFromUser = false))
             _modelState.value = ModelState.READY
         } catch (e: Exception) {
             _errorMessage.value = "Engine Error: ${e.message}"; _modelState.value = ModelState.ERROR
@@ -188,7 +197,7 @@ class ChatViewModel : ViewModel() {
 
         viewModelScope.launch(Dispatchers.IO) {
             try {
-                updateBotStatus(botMsgId, "Thinking...", true)
+                updateBotStatus(botMsgId, "Analyzing...", true)
                 val decision = querySync("SYSTEM: Reply RAG_REQUIRED if the user asks for facts, else reply DIRECT. USER: $prompt")
                 if (decision.contains("RAG_REQUIRED", ignoreCase = true)) {
                     updateBotStatus(botMsgId, "Retrieving Local Context...", true)
@@ -200,8 +209,8 @@ class ChatViewModel : ViewModel() {
                             vectorDB.searchVector(vector)
                         } catch (e: Exception) { vectorDB.searchKeyword(prompt) }
                     }
-                    val contextString = if(contextList.isEmpty()) "No data found." else contextList.joinToString("\n---\n")
-                    streamResponse(botMsgId, "CONTEXT:\n$contextString\n\nUSER: $prompt")
+                    val contextString = if(contextList.isEmpty()) "No local data found." else contextList.joinToString("\n---\n")
+                    streamResponse(botMsgId, "CONTEXT:\n$contextString\n\nUSER QUESTION: $prompt")
                 } else {
                     streamResponse(botMsgId, prompt)
                 }
@@ -239,6 +248,9 @@ class ChatViewModel : ViewModel() {
     }
 }
 
+/**
+ * UI
+ */
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -267,12 +279,12 @@ fun MainScreen(viewModel: ChatViewModel = viewModel()) {
         Box(Modifier.padding(padding).fillMaxSize()) {
             when(state) {
                 ModelState.CHECKING -> LoadingUI("Checking Storage...")
-                ModelState.NEEDS_MAIN_MODEL -> SetupUI("1. Select Gemma .bin", "Select") { p1.launch(arrayOf("*/*")) }
-                ModelState.NEEDS_EMBEDDING_MODEL -> SetupUI("2. Select Embedding .tflite", "Select") { p2.launch(arrayOf("*/*")) }
-                ModelState.NEEDS_FAISS_DB -> SetupUI("3. Select Knowledge .json", "Select") { p3.launch(arrayOf("*/*")) }
-                ModelState.COPYING -> LoadingUI("Streaming File to Disk...")
-                ModelState.LOADING_DB -> LoadingUI("Initializing AI...")
-                ModelState.ERROR -> SetupUI("Critical Error:\n$error", "Reset All") { viewModel.reset(context) }
+                ModelState.NEEDS_MAIN_MODEL -> SetupUI("1. Select Gemma-1B/2B", "Select File") { p1.launch(arrayOf("*/*")) }
+                ModelState.NEEDS_EMBEDDING_MODEL -> SetupUI("2. Select Embedding Model", "Select File") { p2.launch(arrayOf("*/*")) }
+                ModelState.NEEDS_FAISS_DB -> SetupUI("3. Select Knowledge Base", "Select JSON") { p3.launch(arrayOf("*/*")) }
+                ModelState.COPYING -> LoadingUI("Saving Models to App Storage...")
+                ModelState.LOADING_DB -> LoadingUI("Starting AI Engines...")
+                ModelState.ERROR -> SetupUI("Critical Error:\n$error", "Reset App") { viewModel.reset(context) }
                 ModelState.READY -> ChatList(messages)
             }
         }
