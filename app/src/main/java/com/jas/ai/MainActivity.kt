@@ -3,6 +3,7 @@ package com.jas.ai
 import android.content.Context
 import android.net.Uri
 import android.os.Bundle
+import android.util.JsonReader
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
@@ -38,9 +39,9 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
-import org.json.JSONArray
 import java.io.File
 import java.io.FileOutputStream
+import java.io.FileReader
 import java.util.UUID
 
 enum class ModelState {
@@ -72,14 +73,35 @@ class LocalVectorDB {
             throw IllegalArgumentException("faiss_db.json not found in internal storage.")
         }
 
-        val jsonStr = dbFile.readText()
-        val jsonArray = JSONArray(jsonStr)
-        for (i in 0 until jsonArray.length()) {
-            val obj = jsonArray.getJSONObject(i)
-            val text = obj.getString("text")
-            val vecArray = obj.getJSONArray("vector")
-            val vector = FloatArray(vecArray.length()) { vecArray.getDouble(it).toFloat() }
-            records.add(Record(text, vector))
+        // Use JsonReader to stream the massive file chunk-by-chunk 
+        // avoiding OutOfMemoryError (OOM) crashes.
+        JsonReader(FileReader(dbFile)).use { reader ->
+            reader.beginArray()
+            while (reader.hasNext()) {
+                var text = ""
+                val vectorList = mutableListOf<Float>()
+
+                reader.beginObject()
+                while (reader.hasNext()) {
+                    when (reader.nextName()) {
+                        "text" -> text = reader.nextString()
+                        "vector" -> {
+                            reader.beginArray()
+                            while (reader.hasNext()) {
+                                vectorList.add(reader.nextDouble().toFloat())
+                            }
+                            reader.endArray()
+                        }
+                        else -> reader.skipValue()
+                    }
+                }
+                reader.endObject()
+
+                if (text.isNotBlank() && vectorList.isNotEmpty()) {
+                    records.add(Record(text, vectorList.toFloatArray()))
+                }
+            }
+            reader.endArray()
         }
     }
 
@@ -143,7 +165,7 @@ class ChatViewModel : ViewModel() {
                             vectorDB.loadFromFile(faissFile)
                             isVectorDBLoaded = true
                             initializeEngines(mainFile.absolutePath, embedFile.absolutePath)
-                        } catch (e: Exception) {
+                        } catch (e: Throwable) { // Changed to Throwable to catch OutOfMemoryError
                             _errorMessage.value = "Failed to load Faiss DB: ${e.message}"
                             _modelState.value = ModelState.ERROR
                         }
@@ -170,7 +192,7 @@ class ChatViewModel : ViewModel() {
                     }
                 }
                 checkState(context)
-            } catch (e: Exception) {
+            } catch (e: Throwable) { // Changed to Throwable to catch OutOfMemoryError
                 if (targetFile.exists()) targetFile.delete()
                 _errorMessage.value = e.message ?: "Failed to copy file"
                 _modelState.value = ModelState.ERROR
@@ -366,7 +388,6 @@ fun MainScreen(viewModel: ChatViewModel = viewModel()) {
         contract = ActivityResultContracts.OpenDocument()
     ) { uri: Uri? -> uri?.let { viewModel.copyFileToInternalStorage(context, it, "embedding_model.litertlm") } }
 
-    // Switched to standard file picker for the JSON database file!
     val faissPickerLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenDocument()
     ) { uri: Uri? -> uri?.let { viewModel.copyFileToInternalStorage(context, it, "faiss_db.json") } }
