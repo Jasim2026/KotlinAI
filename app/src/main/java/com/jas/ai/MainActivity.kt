@@ -49,9 +49,6 @@ enum class ModelState { CHECKING, NEEDS_MAIN_MODEL, NEEDS_EMBEDDING_MODEL, NEEDS
 
 data class ChatMessage(val id: String = UUID.randomUUID().toString(), val text: String, val isFromUser: Boolean, val isLoading: Boolean = false)
 
-/**
- * VECTOR SEARCH WITH KEYWORD FALLBACK
- */
 class LocalVectorDB {
     data class Record(val text: String, val vector: FloatArray)
     private val records = mutableListOf<Record>()
@@ -85,24 +82,19 @@ class LocalVectorDB {
         }
     }
 
-    // AI Semantic Search
     fun searchVector(query: FloatArray, topK: Int = 3): List<String> {
         if (records.isEmpty()) return emptyList()
         return records.map { it.text to cosineSimilarity(query, it.vector) }
             .sortedByDescending { it.second }.take(topK).map { it.first }
     }
 
-    // FALLBACK: Keyword Search (BM25-Lite)
     fun searchKeyword(query: String, topK: Int = 3): List<String> {
         val queryWords = query.lowercase().split(" ").filter { it.length > 3 }.toSet()
         if (queryWords.isEmpty()) return records.take(topK).map { it.text }
-        
         return records.map { record ->
-            val recordText = record.text.lowercase()
-            val score = queryWords.count { recordText.contains(it) }
+            val score = queryWords.count { record.text.lowercase().contains(it) }
             record.text to score
-        }.filter { it.second > 0 }
-            .sortedByDescending { it.second }.take(topK).map { it.first }
+        }.filter { it.second > 0 }.sortedByDescending { it.second }.take(topK).map { it.first }
     }
 
     private fun cosineSimilarity(a: FloatArray, b: FloatArray): Float {
@@ -126,8 +118,6 @@ class ChatViewModel : ViewModel() {
     private var mainConversation: Conversation? = null
     private var textEmbedder: TextEmbedder? = null
     private val vectorDB = LocalVectorDB()
-    
-    // Safety flag
     private var useKeywordFallback = false
 
     fun checkState(context: Context) {
@@ -135,7 +125,6 @@ class ChatViewModel : ViewModel() {
             val main = File(context.filesDir, "main_model.litertlm")
             val embed = File(context.filesDir, "embedding_model.litertlm")
             val faiss = File(context.filesDir, "faiss_db.json")
-
             when {
                 !main.exists() -> _modelState.value = ModelState.NEEDS_MAIN_MODEL
                 !embed.exists() -> _modelState.value = ModelState.NEEDS_EMBEDDING_MODEL
@@ -154,7 +143,10 @@ class ChatViewModel : ViewModel() {
             _modelState.value = ModelState.COPYING
             try {
                 context.contentResolver.openInputStream(uri)?.use { input ->
-                    FileOutputStream(File(context.filesDir, name)).use { it.write(input.readBytes()) }
+                    FileOutputStream(File(context.filesDir, name)).use { output ->
+                        // FIX: use copyTo() to stream the data instead of readBytes() which uses huge RAM
+                        input.copyTo(output)
+                    }
                 }
                 checkState(context)
             } catch (t: Throwable) {
@@ -165,13 +157,11 @@ class ChatViewModel : ViewModel() {
 
     private fun initializeEngines(context: Context, mainPath: String, embedPath: String) {
         try {
-            // 1. Initialize Gemma
             Engine.setNativeMinLogSeverity(LogSeverity.ERROR)
             mainEngine = Engine(EngineConfig(modelPath = mainPath))
             mainEngine?.initialize()
             mainConversation = mainEngine?.createConversation()
 
-            // 2. Initialize Embedder with Fallback
             try {
                 val pfd = ParcelFileDescriptor.open(File(embedPath), ParcelFileDescriptor.MODE_READ_ONLY)
                 val options = TextEmbedder.TextEmbedderOptions.builder()
@@ -180,12 +170,10 @@ class ChatViewModel : ViewModel() {
                 textEmbedder = TextEmbedder.createFromOptions(context, options)
                 useKeywordFallback = false
             } catch (e: Exception) {
-                Log.e("AI", "Embedder failed, falling back to keywords", e)
                 useKeywordFallback = true
             }
 
-            val statusText = if (useKeywordFallback) "Ready (Keyword Search Mode)" else "Ready (Neural Search Mode)"
-            _messages.value = listOf(ChatMessage(text = statusText, isFromUser = false))
+            _messages.value = listOf(ChatMessage(text = "System Ready.", isFromUser = false))
             _modelState.value = ModelState.READY
         } catch (e: Exception) {
             _errorMessage.value = "Engine Error: ${e.message}"; _modelState.value = ModelState.ERROR
@@ -201,11 +189,9 @@ class ChatViewModel : ViewModel() {
         viewModelScope.launch(Dispatchers.IO) {
             try {
                 updateBotStatus(botMsgId, "Thinking...", true)
-                val decision = querySync("SYSTEM: Reply RAG_REQUIRED if the user asks for facts or data, else reply DIRECT. USER: $prompt")
-
+                val decision = querySync("SYSTEM: Reply RAG_REQUIRED if the user asks for facts, else reply DIRECT. USER: $prompt")
                 if (decision.contains("RAG_REQUIRED", ignoreCase = true)) {
                     updateBotStatus(botMsgId, "Retrieving Local Context...", true)
-                    
                     val contextList = if (useKeywordFallback || textEmbedder == null) {
                         vectorDB.searchKeyword(prompt)
                     } else {
@@ -214,13 +200,12 @@ class ChatViewModel : ViewModel() {
                             vectorDB.searchVector(vector)
                         } catch (e: Exception) { vectorDB.searchKeyword(prompt) }
                     }
-
-                    val contextString = if(contextList.isEmpty()) "No local data found." else contextList.joinToString("\n---\n")
-                    streamResponse(botMsgId, "CONTEXT FROM LOCAL FILES:\n$contextString\n\nUSER QUESTION: $prompt")
+                    val contextString = if(contextList.isEmpty()) "No data found." else contextList.joinToString("\n---\n")
+                    streamResponse(botMsgId, "CONTEXT:\n$contextString\n\nUSER: $prompt")
                 } else {
                     streamResponse(botMsgId, prompt)
                 }
-            } catch (e: Exception) { updateBotStatus(botMsgId, "Pipeline Error: ${e.message}", false) }
+            } catch (e: Exception) { updateBotStatus(botMsgId, "Error: ${e.message}", false) }
         }
     }
 
@@ -268,7 +253,6 @@ fun MainScreen(viewModel: ChatViewModel = viewModel()) {
     val error by viewModel.errorMessage.collectAsState()
     val messages by viewModel.messages.collectAsState()
     val context = LocalContext.current
-
     LaunchedEffect(Unit) { viewModel.checkState(context) }
 
     val p1 = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { it?.let { viewModel.copyFile(context, it, "main_model.litertlm") } }
@@ -277,18 +261,18 @@ fun MainScreen(viewModel: ChatViewModel = viewModel()) {
 
     Scaffold(
         topBar = { TopAppBar(title = { Text("Agentic RAG", fontWeight = FontWeight.Bold) }, 
-            actions = { if(state == ModelState.READY) IconButton(onClick={viewModel.reset(context)}){ Text("Reset", color=Color.Red) } }) },
+            actions = { if(state == ModelState.READY) TextButton(onClick={viewModel.reset(context)}){ Text("Reset", color=Color.Red) } }) },
         bottomBar = { if(state == ModelState.READY) ChatInputBar { viewModel.sendMessage(it) } }
     ) { padding ->
         Box(Modifier.padding(padding).fillMaxSize()) {
             when(state) {
                 ModelState.CHECKING -> LoadingUI("Checking Storage...")
-                ModelState.NEEDS_MAIN_MODEL -> SetupUI("1. Gemma-1B/2B Required", "Select .bin File") { p1.launch(arrayOf("*/*")) }
-                ModelState.NEEDS_EMBEDDING_MODEL -> SetupUI("2. Embedding Model Required", "Select .tflite File") { p2.launch(arrayOf("*/*")) }
-                ModelState.NEEDS_FAISS_DB -> SetupUI("3. Knowledge Base Required", "Select .json File") { p3.launch(arrayOf("*/*")) }
-                ModelState.COPYING -> LoadingUI("Securing Models...")
-                ModelState.LOADING_DB -> LoadingUI("Warming up Engines...")
-                ModelState.ERROR -> SetupUI("Critical Error:\n$error", "Full Reset") { viewModel.reset(context) }
+                ModelState.NEEDS_MAIN_MODEL -> SetupUI("1. Select Gemma .bin", "Select") { p1.launch(arrayOf("*/*")) }
+                ModelState.NEEDS_EMBEDDING_MODEL -> SetupUI("2. Select Embedding .tflite", "Select") { p2.launch(arrayOf("*/*")) }
+                ModelState.NEEDS_FAISS_DB -> SetupUI("3. Select Knowledge .json", "Select") { p3.launch(arrayOf("*/*")) }
+                ModelState.COPYING -> LoadingUI("Streaming File to Disk...")
+                ModelState.LOADING_DB -> LoadingUI("Initializing AI...")
+                ModelState.ERROR -> SetupUI("Critical Error:\n$error", "Reset All") { viewModel.reset(context) }
                 ModelState.READY -> ChatList(messages)
             }
         }
@@ -303,7 +287,7 @@ fun LoadingUI(m: String) {
 @Composable
 fun SetupUI(t: String, b: String, onClick: () -> Unit) {
     Column(Modifier.fillMaxSize().padding(32.dp), Arrangement.Center, Alignment.CenterHorizontally) {
-        Text(t, style = MaterialTheme.typography.headlineSmall); Spacer(Modifier.height(20.dp)); Button(onClick) { Text(b) }
+        Text(t, style = MaterialTheme.typography.headlineSmall, textAlign = TextAlign.Center); Spacer(Modifier.height(20.dp)); Button(onClick) { Text(b) }
     }
 }
 
