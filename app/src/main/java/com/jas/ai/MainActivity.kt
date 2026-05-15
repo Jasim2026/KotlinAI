@@ -8,13 +8,11 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Send
 import androidx.compose.material3.*
@@ -24,7 +22,6 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.input.KeyboardCapitalization
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.ViewModel
@@ -43,8 +40,11 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import java.io.File
+import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.io.FileReader
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
 import java.util.UUID
 
 /**
@@ -154,6 +154,9 @@ class ChatViewModel : ViewModel() {
     private var textEmbedder: TextEmbedder? = null
     private val vectorDB = LocalVectorDB()
 
+    // CRITICAL: Prevent Garbage Collection of the model buffer during operation
+    private var embeddingBuffer: ByteBuffer? = null
+
     fun checkState(context: Context) {
         viewModelScope.launch(Dispatchers.IO) {
             val main = File(context.filesDir, "main_model.litertlm")
@@ -170,7 +173,7 @@ class ChatViewModel : ViewModel() {
                         vectorDB.loadFromFile(faiss)
                         initializeEngines(context, main.absolutePath, embed.absolutePath)
                     } catch (t: Throwable) {
-                        _errorMessage.value = "Init Failed: ${t.message}"
+                        _errorMessage.value = t.message ?: "Initialization Failed"
                         _modelState.value = ModelState.ERROR
                     }
                 }
@@ -194,18 +197,35 @@ class ChatViewModel : ViewModel() {
     }
 
     private fun initializeEngines(context: Context, mainPath: String, embedPath: String) {
+        // 1. Initialize Generative Engine (Gemma 1B/2B)
         try {
             Engine.setNativeMinLogSeverity(LogSeverity.ERROR)
             mainEngine = Engine(EngineConfig(modelPath = mainPath))
             mainEngine?.initialize()
             mainConversation = mainEngine?.createConversation()
+        } catch (e: Exception) {
+            throw Exception("Main Engine Error: ${e.message}")
+        }
 
-            val embedFile = File(embedPath)
-            val mappedByteBuffer = java.io.FileInputStream(embedFile).use {
-                it.channel.map(java.nio.channels.FileChannel.MapMode.READ_ONLY, 0, embedFile.length())
+        // 2. Initialize Embedding Engine (Embedding Gemma 300M)
+        try {
+            val file = File(embedPath)
+            val inputStream = FileInputStream(file)
+            val channel = inputStream.channel
+            
+            // NON-NEGOTIABLE FIX: Load to Direct ByteBuffer to bypass mmap allocation limits
+            embeddingBuffer = ByteBuffer.allocateDirect(file.length().toInt()).apply {
+                order(ByteOrder.nativeOrder())
+                channel.read(this)
+                flip()
             }
+            channel.close()
+            inputStream.close()
 
-            val baseOptions = BaseOptions.builder().setModelAssetBuffer(mappedByteBuffer).build()
+            val baseOptions = BaseOptions.builder()
+                .setModelAssetBuffer(embeddingBuffer)
+                .build()
+                
             val options = TextEmbedder.TextEmbedderOptions.builder()
                 .setBaseOptions(baseOptions)
                 .build()
@@ -215,8 +235,7 @@ class ChatViewModel : ViewModel() {
             _messages.value = listOf(ChatMessage(text = "System Ready. Agentic RAG Active.", isFromUser = false))
             _modelState.value = ModelState.READY
         } catch (e: Exception) {
-            _errorMessage.value = "Engine Error: ${e.message}"
-            _modelState.value = ModelState.ERROR
+            throw Exception("Embedding Engine Error: ${e.message}")
         }
     }
 
@@ -276,7 +295,6 @@ class ChatViewModel : ViewModel() {
     private fun generateEmbed(text: String): FloatArray {
         val embedder = textEmbedder ?: throw Exception("Embedder is null")
         val results = embedder.embed(text)
-        // MediaPipe outputs EmbeddingResult -> List<Embedding> -> float[] (FloatArray in Kotlin)
         return results.embeddingResult().embeddings().first().floatEmbedding()
     }
 
@@ -291,9 +309,11 @@ class ChatViewModel : ViewModel() {
 
     fun reset(context: Context) {
         viewModelScope.launch(Dispatchers.IO) {
-            mainConversation?.close()
-            mainEngine?.close()
-            textEmbedder?.close()
+            try { mainConversation?.close() } catch (e: Exception) {}
+            try { mainEngine?.close() } catch (e: Exception) {}
+            try { textEmbedder?.close() } catch (e: Exception) {}
+            embeddingBuffer = null
+            
             File(context.filesDir, "main_model.litertlm").delete()
             File(context.filesDir, "embedding_model.litertlm").delete()
             File(context.filesDir, "faiss_db.json").delete()
@@ -309,6 +329,7 @@ class ChatViewModel : ViewModel() {
         mainConversation?.close()
         mainEngine?.close()
         textEmbedder?.close()
+        embeddingBuffer = null
     }
 }
 
@@ -362,12 +383,12 @@ fun MainScreen(viewModel: ChatViewModel = viewModel()) {
         Box(Modifier.padding(padding).fillMaxSize()) {
             when (state) {
                 ModelState.CHECKING -> LoadingUI("Scanning storage...")
-                ModelState.NEEDS_MAIN_MODEL -> SetupUI("1. Main Model Required", "Select Gemma-1B") { p1.launch(arrayOf("*/*")) }
-                ModelState.NEEDS_EMBEDDING_MODEL -> SetupUI("2. Embedding Model Required", "Select Embedding-300M") { p2.launch(arrayOf("*/*")) }
+                ModelState.NEEDS_MAIN_MODEL -> SetupUI("1. Main Model Required", "Select Gemma-1B/2B (.bin)") { p1.launch(arrayOf("*/*")) }
+                ModelState.NEEDS_EMBEDDING_MODEL -> SetupUI("2. Embedding Model Required", "Select Embedding-300M (.tflite)") { p2.launch(arrayOf("*/*")) }
                 ModelState.NEEDS_FAISS_DB -> SetupUI("3. Vector DB Required", "Select faiss_db.json") { p3.launch(arrayOf("*/*")) }
                 ModelState.COPYING -> LoadingUI("Copying files to app sandbox...")
                 ModelState.LOADING_DB -> LoadingUI("Loading Vector DB...")
-                ModelState.ERROR -> SetupUI("Error: $error", "Retry") { viewModel.checkState(context) }
+                ModelState.ERROR -> SetupUI("Error:\n$error", "Reset & Try Again") { viewModel.reset(context) }
                 ModelState.READY -> ChatList(messages)
             }
         }
