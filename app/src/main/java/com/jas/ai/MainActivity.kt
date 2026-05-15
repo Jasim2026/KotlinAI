@@ -34,14 +34,14 @@ import com.google.ai.edge.litertlm.Conversation
 import com.google.ai.edge.litertlm.Engine
 import com.google.ai.edge.litertlm.EngineConfig
 import com.google.ai.edge.litertlm.LogSeverity
+import com.google.mediapipe.tasks.core.BaseOptions
+import com.google.mediapipe.tasks.text.textembedder.TextEmbedder
 import com.jas.ai.ui.theme.AppTheme
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
-import org.tensorflow.lite.task.core.BaseOptions
-import org.tensorflow.lite.task.text.embedder.TextEmbedder
 import java.io.File
 import java.io.FileOutputStream
 import java.io.FileReader
@@ -168,7 +168,7 @@ class ChatViewModel : ViewModel() {
                     try {
                         _modelState.value = ModelState.LOADING_DB
                         vectorDB.loadFromFile(faiss)
-                        initializeEngines(main.absolutePath, embed.absolutePath)
+                        initializeEngines(context, main.absolutePath, embed.absolutePath)
                     } catch (t: Throwable) {
                         _errorMessage.value = "Init Failed: ${t.message}"
                         _modelState.value = ModelState.ERROR
@@ -193,19 +193,24 @@ class ChatViewModel : ViewModel() {
         }
     }
 
-    private fun initializeEngines(mainPath: String, embedPath: String) {
+    private fun initializeEngines(context: Context, mainPath: String, embedPath: String) {
         try {
             Engine.setNativeMinLogSeverity(LogSeverity.ERROR)
             mainEngine = Engine(EngineConfig(modelPath = mainPath))
             mainEngine?.initialize()
             mainConversation = mainEngine?.createConversation()
 
-            val baseOptions = BaseOptions.builder().build()
+            val embedFile = File(embedPath)
+            val mappedByteBuffer = java.io.FileInputStream(embedFile).use {
+                it.channel.map(java.nio.channels.FileChannel.MapMode.READ_ONLY, 0, embedFile.length())
+            }
+
+            val baseOptions = BaseOptions.builder().setModelAssetBuffer(mappedByteBuffer).build()
             val options = TextEmbedder.TextEmbedderOptions.builder()
                 .setBaseOptions(baseOptions)
                 .build()
             
-            textEmbedder = TextEmbedder.createFromFileAndOptions(File(embedPath), options)
+            textEmbedder = TextEmbedder.createFromOptions(context, options)
 
             _messages.value = listOf(ChatMessage(text = "System Ready. Agentic RAG Active.", isFromUser = false))
             _modelState.value = ModelState.READY
@@ -271,8 +276,8 @@ class ChatViewModel : ViewModel() {
     private fun generateEmbed(text: String): FloatArray {
         val embedder = textEmbedder ?: throw Exception("Embedder is null")
         val results = embedder.embed(text)
-        // 0.4.4 API: List<Embedding> -> List<FeatureVector> -> FloatArray
-        return results[0].featureVector.floatArray
+        // MediaPipe outputs EmbeddingResult -> List<Embedding> -> float[] (FloatArray in Kotlin)
+        return results.embeddingResult().embeddings().first().floatEmbedding()
     }
 
     private fun updateBotStatus(id: String, text: String, loading: Boolean) {

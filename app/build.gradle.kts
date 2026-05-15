@@ -69,6 +69,6 @@ dependencies {
     // LiteRT-LM for gemma-1b-it-int4 (Generative)
     implementation("com.google.ai.edge.litertlm:litertlm-android:0.11.0") 
     
-    // TFLite Task Library for embeddinggemma-300m (Embedding)
-    implementation("org.tensorflow:tensorflow-lite-task-text:0.4.4")
+    // MediaPipe Tasks Text for embedding (Replaces deprecated tensorflow-lite-task-text)
+    implementation("com.google.mediapipe:tasks-text:0.10.14")
 }
