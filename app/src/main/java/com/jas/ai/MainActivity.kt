@@ -21,6 +21,7 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardCapitalization
@@ -46,6 +47,10 @@ import java.io.FileOutputStream
 import java.io.FileReader
 import java.util.UUID
 
+/**
+ * MODELS STATE ENUM
+ * Orchestrates the multi-step initialization process
+ */
 enum class ModelState {
     CHECKING,
     NEEDS_MAIN_MODEL,
@@ -57,6 +62,9 @@ enum class ModelState {
     ERROR
 }
 
+/**
+ * CHAT DATA MODEL
+ */
 data class ChatMessage(
     val id: String = UUID.randomUUID().toString(),
     val text: String,
@@ -64,41 +72,40 @@ data class ChatMessage(
     val isLoading: Boolean = false
 )
 
+/**
+ * VECTOR SEARCH ENGINE
+ * Optimized for local memory using streaming JSON parsing
+ */
 class LocalVectorDB {
     data class Record(val text: String, val vector: FloatArray)
     private val records = mutableListOf<Record>()
 
     fun loadFromFile(dbFile: File) {
         records.clear()
+        if (!dbFile.exists()) return
         
-        if (!dbFile.exists()) {
-            throw IllegalArgumentException("faiss_db.json not found in internal storage.")
-        }
-
         JsonReader(FileReader(dbFile)).use { reader ->
             reader.beginArray()
             while (reader.hasNext()) {
                 var text = ""
-                val vectorList = mutableListOf<Float>()
-
+                var vector: FloatArray? = null
                 reader.beginObject()
                 while (reader.hasNext()) {
                     when (reader.nextName()) {
                         "text" -> text = reader.nextString()
                         "vector" -> {
+                            val list = mutableListOf<Float>()
                             reader.beginArray()
-                            while (reader.hasNext()) {
-                                vectorList.add(reader.nextDouble().toFloat())
-                            }
+                            while (reader.hasNext()) list.add(reader.nextDouble().toFloat())
                             reader.endArray()
+                            vector = list.toFloatArray()
                         }
                         else -> reader.skipValue()
                     }
                 }
                 reader.endObject()
-
-                if (text.isNotBlank() && vectorList.isNotEmpty()) {
-                    records.add(Record(text, vectorList.toFloatArray()))
+                if (text.isNotEmpty() && vector != null) {
+                    records.add(Record(text, vector))
                 }
             }
             reader.endArray()
@@ -107,29 +114,30 @@ class LocalVectorDB {
 
     fun search(query: FloatArray, topK: Int = 3): List<String> {
         if (records.isEmpty()) return emptyList()
-        return records.map { record ->
-            val dist = cosineSimilarity(query, record.vector)
-            Pair(record.text, dist)
-        }.sortedByDescending { it.second }.take(topK).map { it.first }
+        return records.map { it.text to cosineSimilarity(query, it.vector) }
+            .sortedByDescending { it.second }
+            .take(topK)
+            .map { it.first }
     }
 
     private fun cosineSimilarity(a: FloatArray, b: FloatArray): Float {
-        var dot = 0f
+        var dotProduct = 0f
         var normA = 0f
         var normB = 0f
         for (i in a.indices) {
-            dot += a[i] * b[i]
+            dotProduct += a[i] * b[i]
             normA += a[i] * a[i]
             normB += b[i] * b[i]
         }
-        return dot / (kotlin.math.sqrt(normA) * kotlin.math.sqrt(normB))
+        return dotProduct / (kotlin.math.sqrt(normA) * kotlin.math.sqrt(normB))
     }
 
-    fun clear() {
-        records.clear()
-    }
+    fun clear() = records.clear()
 }
 
+/**
+ * VIEWMODEL - AGENTIC PIPELINE ORCHESTRATOR
+ */
 class ChatViewModel : ViewModel() {
     private val _messages = MutableStateFlow<List<ChatMessage>>(emptyList())
     val messages: StateFlow<List<ChatMessage>> = _messages.asStateFlow()
@@ -140,60 +148,50 @@ class ChatViewModel : ViewModel() {
     private val _errorMessage = MutableStateFlow("")
     val errorMessage: StateFlow<String> = _errorMessage.asStateFlow()
 
+    // LiteRT-LM (Gemma 1B)
     private var mainEngine: Engine? = null
     private var mainConversation: Conversation? = null
+    
+    // TFLite Task Library (Embedding Gemma 300M)
     private var textEmbedder: TextEmbedder? = null
     
     private val vectorDB = LocalVectorDB()
-    private var isVectorDBLoaded = false
 
     fun checkState(context: Context) {
         viewModelScope.launch(Dispatchers.IO) {
-            val mainFile = File(context.filesDir, "main_model.litertlm")
-            val embedFile = File(context.filesDir, "embedding_model.litertlm")
-            val faissFile = File(context.filesDir, "faiss_db.json")
+            val main = File(context.filesDir, "main_model.litertlm")
+            val embed = File(context.filesDir, "embedding_model.litertlm")
+            val faiss = File(context.filesDir, "faiss_db.json")
 
             when {
-                !mainFile.exists() || mainFile.length() == 0L -> _modelState.value = ModelState.NEEDS_MAIN_MODEL
-                !embedFile.exists() || embedFile.length() == 0L -> _modelState.value = ModelState.NEEDS_EMBEDDING_MODEL
-                !faissFile.exists() || faissFile.length() == 0L -> _modelState.value = ModelState.NEEDS_FAISS_DB
+                !main.exists() -> _modelState.value = ModelState.NEEDS_MAIN_MODEL
+                !embed.exists() -> _modelState.value = ModelState.NEEDS_EMBEDDING_MODEL
+                !faiss.exists() -> _modelState.value = ModelState.NEEDS_FAISS_DB
                 else -> {
-                    if (!isVectorDBLoaded) {
+                    try {
                         _modelState.value = ModelState.LOADING_DB
-                        try {
-                            vectorDB.loadFromFile(faissFile)
-                            isVectorDBLoaded = true
-                            initializeEngines(mainFile.absolutePath, embedFile.absolutePath)
-                        } catch (e: Throwable) { 
-                            _errorMessage.value = "Failed to load Faiss DB: ${e.message}"
-                            _modelState.value = ModelState.ERROR
-                        }
-                    } else {
-                        if (mainEngine == null || textEmbedder == null) {
-                            initializeEngines(mainFile.absolutePath, embedFile.absolutePath)
-                        } else {
-                            _modelState.value = ModelState.READY
-                        }
+                        vectorDB.loadFromFile(faiss)
+                        initializeEngines(main.absolutePath, embed.absolutePath)
+                    } catch (t: Throwable) {
+                        _errorMessage.value = "Init Failed: ${t.message}"
+                        _modelState.value = ModelState.ERROR
                     }
                 }
             }
         }
     }
 
-    fun copyFileToInternalStorage(context: Context, uri: Uri, targetFileName: String) {
+    fun copyFile(context: Context, uri: Uri, name: String) {
         viewModelScope.launch(Dispatchers.IO) {
             _modelState.value = ModelState.COPYING
-            val targetFile = File(context.filesDir, targetFileName)
             try {
                 context.contentResolver.openInputStream(uri)?.use { input ->
-                    FileOutputStream(targetFile).use { output ->
-                        input.copyTo(output)
-                    }
+                    val file = File(context.filesDir, name)
+                    FileOutputStream(file).use { input.copyTo(it) }
                 }
                 checkState(context)
-            } catch (e: Throwable) { 
-                if (targetFile.exists()) targetFile.delete()
-                _errorMessage.value = e.message ?: "Failed to copy file"
+            } catch (t: Throwable) {
+                _errorMessage.value = "Copy Failed: ${t.message}"
                 _modelState.value = ModelState.ERROR
             }
         }
@@ -201,137 +199,119 @@ class ChatViewModel : ViewModel() {
 
     private fun initializeEngines(mainPath: String, embedPath: String) {
         try {
+            // 1. Initialize Generative Engine
             Engine.setNativeMinLogSeverity(LogSeverity.ERROR)
-            mainEngine = Engine(EngineConfig(modelPath = mainPath))
-            mainEngine?.initialize()
+            mainEngine = Engine(EngineConfig(modelPath = mainPath)).apply { initialize() }
             mainConversation = mainEngine?.createConversation()
-            
+
+            // 2. Initialize Embedding Engine
             val baseOptions = BaseOptions.builder().build()
             val embedderOptions = TextEmbedder.TextEmbedderOptions.builder()
                 .setBaseOptions(baseOptions)
                 .build()
-            
-            // CORRECTED: createFromFileAndOptions takes a File, not a Context
             textEmbedder = TextEmbedder.createFromFileAndOptions(File(embedPath), embedderOptions)
-            
-            _messages.value = listOf(
-                ChatMessage(
-                    text = "Agentic RAG System ready.\nMain Model, TextEmbedder, and JSON Vector DB loaded securely.",
-                    isFromUser = false
-                )
-            )
+
+            _messages.value = listOf(ChatMessage("Local Agent Active. RAG-ready.", false))
             _modelState.value = ModelState.READY
         } catch (e: Exception) {
-            _errorMessage.value = e.message ?: "Failed to initialize Edge AI engines"
+            _errorMessage.value = "Engine Error: ${e.message}"
             _modelState.value = ModelState.ERROR
         }
     }
 
     fun sendMessage(text: String) {
         if (text.isBlank()) return
-
-        val userMessage = ChatMessage(text = text, isFromUser = true)
-        val placeholderBotMessage = ChatMessage(text = "", isFromUser = false, isLoading = true)
-        _messages.value = _messages.value + userMessage + placeholderBotMessage
+        _messages.value += ChatMessage(text, true)
+        
+        val agentMsgId = UUID.randomUUID().toString()
+        _messages.value += ChatMessage(id = agentMsgId, text = "", isFromUser = false, isLoading = true)
 
         viewModelScope.launch(Dispatchers.IO) {
             try {
-                updateLastBotMessage("Agent is deciding if RAG is needed...", isLoading = true)
-                val agentPrompt = """
-                    System: You are an intelligent routing agent. Decide if external knowledge is required to answer the user query accurately.
-                    If YES, reply EXACTLY with "RAG_REQUIRED". If NO, reply EXACTLY with "DIRECT_ANSWER".
-                    User: $text
+                // PHASE 1: AGENTIC ROUTING
+                updateBotStatus(agentMsgId, "Agent deciding if context is needed...", true)
+                val routerPrompt = """
+                    SYSTEM: You are a routing agent.
+                    If the user query requires external knowledge or facts, reply ONLY with 'RAG_REQUIRED'.
+                    If it is a general chat or greeting, reply ONLY with 'DIRECT_ANSWER'.
+                    USER: $text
                 """.trimIndent()
                 
-                val routeResponse = queryMainModelSync(agentPrompt)
-                val needsRag = routeResponse.contains("RAG_REQUIRED", ignoreCase = true)
+                val decision = querySync(routerPrompt)
+                val isRag = decision.contains("RAG_REQUIRED", ignoreCase = true)
 
-                if (needsRag) {
-                    updateLastBotMessage("Agent routing... Generating embedding...", isLoading = true)
+                if (isRag) {
+                    // PHASE 2: RETRIEVAL
+                    updateBotStatus(agentMsgId, "RAG Triggered. Embedding query...", true)
+                    val vector = generateEmbed(text)
                     
-                    val queryEmbedding = generateEmbedding(text)
-                    
-                    updateLastBotMessage("Searching local Vector DB...", isLoading = true)
-                    val contextTexts = vectorDB.search(queryEmbedding, topK = 3)
-                    val combinedContext = contextTexts.joinToString("\n\n")
-                    
-                    updateLastBotMessage("Context found. Generating final answer...", isLoading = true)
+                    updateBotStatus(agentMsgId, "Searching local Faiss DB...", true)
+                    val contextList = vectorDB.search(vector)
+                    val contextString = contextList.joinToString("\n---\n")
+
+                    // PHASE 3: AUGMENTED GENERATION
+                    updateBotStatus(agentMsgId, "Synthesizing answer from context...", true)
                     val ragPrompt = """
-                        System: Use the following context to answer the user's question accurately.
-                        Context: $combinedContext
-                        User: $text
+                        SYSTEM: Answer using only the provided context.
+                        CONTEXT: $contextString
+                        USER: $text
                     """.trimIndent()
-                    
-                    streamMainModelResponse(ragPrompt)
+                    streamResponse(agentMsgId, ragPrompt)
                 } else {
-                    updateLastBotMessage("Agent decided RAG is NOT needed. Answering directly...", isLoading = true)
-                    streamMainModelResponse(text)
+                    // PHASE 2 (ALTERNATIVE): DIRECT ANSWER
+                    updateBotStatus(agentMsgId, "Direct answer chosen...", true)
+                    streamResponse(agentMsgId, text)
                 }
             } catch (e: Exception) {
-                updateLastBotMessage("Error generating response: ${e.message}", isLoading = false)
+                updateBotStatus(agentMsgId, "Pipeline Error: ${e.message}", false)
             }
         }
     }
-    
-    private suspend fun queryMainModelSync(prompt: String): String {
-        val tempConv = mainEngine?.createConversation() ?: throw IllegalStateException("Main Engine not ready")
-        var response = ""
-        try {
-            tempConv.sendMessageAsync(prompt).collect { token -> response += token }
-        } finally {
-            tempConv.close()
+
+    private suspend fun querySync(p: String): String {
+        val conv = mainEngine?.createConversation() ?: return ""
+        var res = ""
+        conv.sendMessageAsync(p).collect { res += it }
+        conv.close()
+        return res.trim()
+    }
+
+    private suspend fun streamResponse(msgId: String, p: String) {
+        var fullText = ""
+        mainConversation?.sendMessageAsync(p)?.collect { token ->
+            fullText += token
+            updateBotStatus(msgId, fullText, true)
         }
-        return response.trim()
+        updateBotStatus(msgId, fullText, false)
     }
 
-    private suspend fun streamMainModelResponse(prompt: String) {
-        val currentConv = mainConversation ?: throw IllegalStateException("Conversation not ready")
-        var fullResponse = ""
-        currentConv.sendMessageAsync(prompt).collect { token ->
-            fullResponse += token
-            updateLastBotMessage(fullResponse, isLoading = true)
+    private fun generateEmbed(text: String): FloatArray {
+        val embedder = textEmbedder ?: throw Exception("Embedder not initialized")
+        val result = embedder.embed(text)
+        return result.embeddingResult.embeddings.first().floatArray
+    }
+
+    private fun updateBotStatus(id: String, text: String, loading: Boolean) {
+        val currentList = _messages.value.toMutableList()
+        val index = currentList.indexOfFirst { it.id == id }
+        if (index != -1) {
+            currentList[index] = currentList[index].copy(text = text, isLoading = loading)
+            _messages.value = currentList
         }
-        updateLastBotMessage(fullResponse, isLoading = false)
     }
 
-    private fun generateEmbedding(text: String): FloatArray {
-        val embedder = textEmbedder ?: throw IllegalStateException("TextEmbedder not initialized")
-        val results = embedder.embed(text)
-        
-        // CORRECTED: The API call chain is results.embeddingResult().embeddings()
-        return results.embeddingResult().embeddings().firstOrNull()?.floatArray 
-            ?: throw IllegalStateException("TextEmbedder failed to return a valid float array")
-    }
-
-    fun resetModel(context: Context) {
+    fun reset(context: Context) {
         viewModelScope.launch(Dispatchers.IO) {
             mainConversation?.close()
             mainEngine?.close()
             textEmbedder?.close()
-            
-            mainEngine = null
-            mainConversation = null
-            textEmbedder = null
-            
             File(context.filesDir, "main_model.litertlm").delete()
             File(context.filesDir, "embedding_model.litertlm").delete()
             File(context.filesDir, "faiss_db.json").delete()
-            
-            isVectorDBLoaded = false
             vectorDB.clear()
-            
             _messages.value = emptyList()
             _modelState.value = ModelState.CHECKING
             checkState(context)
-        }
-    }
-
-    private fun updateLastBotMessage(text: String, isLoading: Boolean) {
-        val currentList = _messages.value.toMutableList()
-        val lastIndex = currentList.indexOfLast { !it.isFromUser }
-        if (lastIndex != -1) {
-            currentList[lastIndex] = currentList[lastIndex].copy(text = text, isLoading = isLoading)
-            _messages.value = currentList
         }
     }
 
@@ -343,15 +323,15 @@ class ChatViewModel : ViewModel() {
     }
 }
 
+/**
+ * MAIN ACTIVITY & UI
+ */
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContent {
             AppTheme {
-                Surface(
-                    modifier = Modifier.fillMaxSize(),
-                    color = MaterialTheme.colorScheme.background
-                ) {
+                Surface(modifier = Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
                     MainScreen()
                 }
             }
@@ -362,234 +342,131 @@ class MainActivity : ComponentActivity() {
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun MainScreen(viewModel: ChatViewModel = viewModel()) {
-    val modelState by viewModel.modelState.collectAsState()
-    val errorMessage by viewModel.errorMessage.collectAsState()
+    val state by viewModel.modelState.collectAsState()
+    val error by viewModel.errorMessage.collectAsState()
     val messages by viewModel.messages.collectAsState()
     val context = LocalContext.current
 
-    LaunchedEffect(Unit) {
-        viewModel.checkState(context)
+    LaunchedEffect(Unit) { viewModel.checkState(context) }
+
+    val mainPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) {
+        it?.let { viewModel.copyFile(context, it, "main_model.litertlm") }
     }
-
-    val mainModelPicker = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.OpenDocument()
-    ) { uri: Uri? -> uri?.let { viewModel.copyFileToInternalStorage(context, it, "main_model.litertlm") } }
-
-    val embeddingModelPicker = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.OpenDocument()
-    ) { uri: Uri? -> uri?.let { viewModel.copyFileToInternalStorage(context, it, "embedding_model.litertlm") } }
-
-    val faissPickerLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.OpenDocument()
-    ) { uri: Uri? -> uri?.let { viewModel.copyFileToInternalStorage(context, it, "faiss_db.json") } }
+    val embedPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) {
+        it?.let { viewModel.copyFile(context, it, "embedding_model.litertlm") }
+    }
+    val jsonPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) {
+        it?.let { viewModel.copyFile(context, it, "faiss_db.json") }
+    }
 
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text("Agentic Kotlin AI", fontWeight = FontWeight.Bold) },
-                colors = TopAppBarDefaults.topAppBarColors(
-                    containerColor = MaterialTheme.colorScheme.primaryContainer,
-                    titleContentColor = MaterialTheme.colorScheme.onPrimaryContainer
-                ),
+                title = { Text("Agentic Kotlin RAG", fontWeight = FontWeight.ExtraBold) },
+                colors = TopAppBarDefaults.topAppBarColors(containerColor = MaterialTheme.colorScheme.primaryContainer),
                 actions = {
-                    if (modelState == ModelState.READY || modelState == ModelState.ERROR) {
-                        Button(onClick = { viewModel.resetModel(context) }) {
-                            Text("Reset")
+                    if (state == ModelState.READY) {
+                        IconButton(onClick = { viewModel.reset(context) }) {
+                            Text("Reset", color = MaterialTheme.colorScheme.error, fontWeight = FontWeight.Bold)
                         }
                     }
                 }
             )
         },
         bottomBar = {
-            if (modelState == ModelState.READY) {
-                ChatInputBar(
-                    onSendMessage = { viewModel.sendMessage(it) }
-                )
+            if (state == ModelState.READY) {
+                ChatInputBar { viewModel.sendMessage(it) }
             }
         }
-    ) { paddingValues ->
-        Box(
-            modifier = Modifier
-                .padding(paddingValues)
-                .fillMaxSize()
-        ) {
-            when (modelState) {
-                ModelState.CHECKING -> LoadingScreen("Checking storage...")
-                ModelState.NEEDS_MAIN_MODEL -> ActionScreen(
-                    message = "Agentic Pipeline Step 1:\nPlease select your Main Model\n(e.g., gemma-1b-it-int4.litertlm)",
-                    buttonText = "Select Main Model",
-                    onClick = { mainModelPicker.launch(arrayOf("*/*")) }
-                )
-                ModelState.NEEDS_EMBEDDING_MODEL -> ActionScreen(
-                    message = "Agentic Pipeline Step 2:\nPlease select your Embedding Model\n(e.g., embeddinggemma-300m.litertlm)",
-                    buttonText = "Select Embedding Model",
-                    onClick = { embeddingModelPicker.launch(arrayOf("*/*")) }
-                )
-                ModelState.NEEDS_FAISS_DB -> ActionScreen(
-                    message = "Agentic Pipeline Step 3:\nPlease select your JSON Vector DB\n(faiss_db.json file)",
-                    buttonText = "Select JSON File",
-                    onClick = { faissPickerLauncher.launch(arrayOf("application/json", "*/*")) }
-                )
-                ModelState.COPYING -> LoadingScreen("Copying file to secure internal storage...\nThis might take a moment.")
-                ModelState.LOADING_DB -> LoadingScreen("Loading Faiss Vector DB into memory...")
-                ModelState.ERROR -> ActionScreen(
-                    message = "An error occurred:\n$errorMessage",
-                    buttonText = "Try Again",
-                    onClick = { viewModel.checkState(context) }
-                )
+    ) { padding ->
+        Box(Modifier.padding(padding).fillMaxSize()) {
+            when (state) {
+                ModelState.CHECKING -> LoadingUI("Scanning Internal Storage...")
+                ModelState.NEEDS_MAIN_MODEL -> SetupUI("Step 1: Main Model Required", "Select gemma-1b.litertlm") {
+                    mainPicker.launch(arrayOf("*/*"))
+                }
+                ModelState.NEEDS_EMBEDDING_MODEL -> SetupUI("Step 2: Embedding Model Required", "Select embedding-300m.litertlm") {
+                    embedPicker.launch(arrayOf("*/*"))
+                }
+                ModelState.NEEDS_FAISS_DB -> SetupUI("Step 3: Vector Knowledge Required", "Select faiss_db.json") {
+                    jsonPicker.launch(arrayOf("application/json", "*/*"))
+                }
+                ModelState.COPYING -> LoadingUI("Securing file in app sandbox...")
+                ModelState.LOADING_DB -> LoadingUI("Streaming Vector DB into RAM...")
+                ModelState.ERROR -> SetupUI("Critical Error Occurred", "Fix & Retry: $error") {
+                    viewModel.checkState(context)
+                }
                 ModelState.READY -> ChatList(messages)
             }
         }
     }
 }
 
-// Keep all the Composable functions (LoadingScreen, ActionScreen, etc.) below this line as they were. They are correct.
 @Composable
-fun LoadingScreen(message: String) {
-    Column(
-        modifier = Modifier.fillMaxSize().padding(32.dp),
-        horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.Center
-    ) {
-        CircularProgressIndicator(modifier = Modifier.size(64.dp))
-        Spacer(modifier = Modifier.height(24.dp))
-        Text(
-            text = message,
-            textAlign = TextAlign.Center,
-            style = MaterialTheme.typography.bodyLarge
-        )
+fun LoadingUI(m: String) {
+    Column(Modifier.fillMaxSize(), Arrangement.Center, Alignment.CenterHorizontally) {
+        CircularProgressIndicator(Modifier.size(60.dp))
+        Spacer(Modifier.height(20.dp))
+        Text(m, style = MaterialTheme.typography.bodyLarge)
     }
 }
 
 @Composable
-fun ActionScreen(message: String, buttonText: String, onClick: () -> Unit) {
-    Column(
-        modifier = Modifier.fillMaxSize().padding(32.dp),
-        horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.Center
-    ) {
-        Text(
-            text = message,
-            textAlign = TextAlign.Center,
-            style = MaterialTheme.typography.bodyLarge
-        )
-        Spacer(modifier = Modifier.height(24.dp))
-        Button(
-            onClick = onClick,
-            shape = RoundedCornerShape(12.dp)
-        ) {
-            Text(buttonText, modifier = Modifier.padding(8.dp))
+fun SetupUI(title: String, btn: String, onClick: () -> Unit) {
+    Column(Modifier.fillMaxSize().padding(40.dp), Arrangement.Center, Alignment.CenterHorizontally) {
+        Text(title, style = MaterialTheme.typography.headlineSmall, textAlign = TextAlign.Center)
+        Spacer(Modifier.height(30.dp))
+        Button(onClick, shape = RoundedCornerShape(12.dp), modifier = Modifier.fillMaxWidth().height(60.dp)) {
+            Text(btn)
         }
     }
 }
 
 @Composable
 fun ChatList(messages: List<ChatMessage>) {
-    val listState = rememberLazyListState()
+    val scrollState = rememberLazyListState()
+    LaunchedEffect(messages.size) { if(messages.isNotEmpty()) scrollState.animateScrollToItem(messages.lastIndex) }
 
-    LaunchedEffect(messages.size, messages.lastOrNull()?.text?.length) {
-        if (messages.isNotEmpty()) {
-            listState.animateScrollToItem(messages.lastIndex)
-        }
-    }
-
-    LazyColumn(
-        state = listState,
-        modifier = Modifier
-            .fillMaxSize()
-            .background(MaterialTheme.colorScheme.background)
-            .padding(horizontal = 16.dp),
-        contentPadding = PaddingValues(vertical = 16.dp),
-    ) {
-        items(messages) { message ->
-            ChatBubble(message)
-            Spacer(modifier = Modifier.height(12.dp))
-        }
+    LazyColumn(state = scrollState, modifier = Modifier.fillMaxSize(), contentPadding = PaddingValues(16.dp)) {
+        items(messages) { ChatBubble(it) }
     }
 }
 
 @Composable
-fun ChatInputBar(onSendMessage: (String) -> Unit) {
-    var inputText by remember { mutableStateOf("") }
+fun ChatBubble(msg: ChatMessage) {
+    val alignment = if (msg.isFromUser) Alignment.CenterEnd else Alignment.CenterStart
+    val color = if (msg.isFromUser) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.surfaceVariant
+    val textColor = if (msg.isFromUser) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onSurfaceVariant
+    val shape = if (msg.isFromUser) RoundedCornerShape(16.dp, 16.dp, 2.dp, 16.dp) else RoundedCornerShape(16.dp, 16.dp, 16.dp, 2.dp)
 
-    BottomAppBar(
-        containerColor = MaterialTheme.colorScheme.surface,
-        contentPadding = PaddingValues(horizontal = 16.dp, vertical = 8.dp),
-        tonalElevation = 8.dp
-    ) {
-        OutlinedTextField(
-            value = inputText,
-            onValueChange = { inputText = it },
-            modifier = Modifier.weight(1f),
-            placeholder = { Text("Ask your AI Agent...") },
-            shape = RoundedCornerShape(24.dp),
-            keyboardOptions = KeyboardOptions(capitalization = KeyboardCapitalization.Sentences),
-            maxLines = 3
-        )
-        Spacer(modifier = Modifier.width(12.dp))
-        FloatingActionButton(
-            onClick = {
-                if (inputText.isNotBlank()) {
-                    onSendMessage(inputText)
-                    inputText = ""
-                }
-            },
-            shape = RoundedCornerShape(16.dp),
-            containerColor = MaterialTheme.colorScheme.primary,
-            contentColor = MaterialTheme.colorScheme.onPrimary,
-            modifier = Modifier.size(56.dp)
-        ) {
-            Icon(imageVector = Icons.Default.Send, contentDescription = null)
-        }
-    }
-}
-
-@Composable
-fun ChatBubble(message: ChatMessage) {
-    val alignment = if (message.isFromUser) Alignment.CenterEnd else Alignment.CenterStart
-    val bubbleColor = if (message.isFromUser) {
-        MaterialTheme.colorScheme.primary
-    } else {
-        MaterialTheme.colorScheme.surfaceVariant
-    }
-    val textColor = if (message.isFromUser) {
-        MaterialTheme.colorScheme.onPrimary
-    } else {
-        MaterialTheme.colorScheme.onSurfaceVariant
-    }
-    val shape = if (message.isFromUser) {
-        RoundedCornerShape(20.dp, 20.dp, 4.dp, 20.dp)
-    } else {
-        RoundedCornerShape(20.dp, 20.dp, 20.dp, 4.dp)
-    }
-
-    Box(
-        modifier = Modifier.fillMaxWidth(),
-        contentAlignment = alignment
-    ) {
-        Column(
-            horizontalAlignment = if (message.isFromUser) Alignment.End else Alignment.Start
-        ) {
-            Surface(
-                shape = shape,
-                color = bubbleColor,
-                shadowElevation = 2.dp,
-                modifier = Modifier.widthIn(max = 300.dp)
-            ) {
-                Text(
-                    text = message.text,
-                    modifier = Modifier.padding(14.dp),
-                    color = textColor,
-                    style = MaterialTheme.typography.bodyLarge
-                )
+    Box(Modifier.fillMaxWidth().padding(vertical = 4.dp), contentAlignment = alignment) {
+        Column(horizontalAlignment = if(msg.isFromUser) Alignment.End else Alignment.Start) {
+            Surface(color = color, shape = shape, shadowElevation = 2.dp) {
+                Text(msg.text, modifier = Modifier.padding(12.dp), color = textColor, style = MaterialTheme.typography.bodyLarge)
             }
-            if (message.isLoading && !message.isFromUser) {
-                Text(
-                    text = "Thinking...",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.5f),
-                    modifier = Modifier.padding(top = 4.dp, start = 8.dp)
-                )
+            if (msg.isLoading) {
+                Text("Processing...", style = MaterialTheme.typography.labelSmall, modifier = Modifier.padding(4.dp), color = Color.Gray)
+            }
+        }
+    }
+}
+
+@Composable
+fun ChatInputBar(onSend: (String) -> Unit) {
+    var text by remember { mutableStateOf("") }
+    Surface(tonalElevation = 8.dp) {
+        Row(Modifier.fillMaxWidth().padding(12.dp).navigationBarsPadding().imePadding(), verticalAlignment = Alignment.CenterVertically) {
+            OutlinedTextField(
+                value = text,
+                onValueChange = { text = it },
+                modifier = Modifier.weight(1f),
+                placeholder = { Text("Ask the local agent...") },
+                shape = RoundedCornerShape(24.dp),
+                keyboardOptions = KeyboardOptions(KeyboardCapitalization.Sentences)
+            )
+            Spacer(Modifier.width(8.dp))
+            FloatingActionButton(onClick = { if(text.isNotBlank()){ onSend(text); text="" } }, shape = RoundedCornerShape(50.dp)) {
+                Icon(Icons.Default.Send, null)
             }
         }
     }
