@@ -3,7 +3,9 @@ package com.jas.ai
 import android.content.Context
 import android.net.Uri
 import android.os.Bundle
+import android.os.ParcelFileDescriptor
 import android.util.JsonReader
+import android.util.Log
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
@@ -22,7 +24,6 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
@@ -40,39 +41,16 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import java.io.File
-import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.io.FileReader
-import java.nio.ByteBuffer
-import java.nio.ByteOrder
 import java.util.UUID
 
-/**
- * MODELS STATE
- */
-enum class ModelState {
-    CHECKING,
-    NEEDS_MAIN_MODEL,
-    NEEDS_EMBEDDING_MODEL,
-    NEEDS_FAISS_DB,
-    LOADING_DB,
-    COPYING,
-    READY,
-    ERROR
-}
+enum class ModelState { CHECKING, NEEDS_MAIN_MODEL, NEEDS_EMBEDDING_MODEL, NEEDS_FAISS_DB, LOADING_DB, COPYING, READY, ERROR }
+
+data class ChatMessage(val id: String = UUID.randomUUID().toString(), val text: String, val isFromUser: Boolean, val isLoading: Boolean = false)
 
 /**
- * CHAT MESSAGE DATA CLASS
- */
-data class ChatMessage(
-    val id: String = UUID.randomUUID().toString(),
-    val text: String,
-    val isFromUser: Boolean,
-    val isLoading: Boolean = false
-)
-
-/**
- * VECTOR SEARCH ENGINE
+ * VECTOR SEARCH WITH KEYWORD FALLBACK
  */
 class LocalVectorDB {
     data class Record(val text: String, val vector: FloatArray)
@@ -81,7 +59,6 @@ class LocalVectorDB {
     fun loadFromFile(dbFile: File) {
         records.clear()
         if (!dbFile.exists()) return
-        
         JsonReader(FileReader(dbFile)).use { reader ->
             reader.beginArray()
             while (reader.hasNext()) {
@@ -94,9 +71,7 @@ class LocalVectorDB {
                         "vector" -> {
                             val list = mutableListOf<Float>()
                             reader.beginArray()
-                            while (reader.hasNext()) {
-                                list.add(reader.nextDouble().toFloat())
-                            }
+                            while (reader.hasNext()) list.add(reader.nextDouble().toFloat())
                             reader.endArray()
                             vector = list.toFloatArray()
                         }
@@ -104,48 +79,46 @@ class LocalVectorDB {
                     }
                 }
                 reader.endObject()
-                if (text.isNotEmpty() && vector != null) {
-                    records.add(Record(text, vector))
-                }
+                if (text.isNotEmpty() && vector != null) records.add(Record(text, vector))
             }
             reader.endArray()
         }
     }
 
-    fun search(query: FloatArray, topK: Int = 3): List<String> {
+    // AI Semantic Search
+    fun searchVector(query: FloatArray, topK: Int = 3): List<String> {
         if (records.isEmpty()) return emptyList()
         return records.map { it.text to cosineSimilarity(query, it.vector) }
-            .sortedByDescending { it.second }
-            .take(topK)
-            .map { it.first }
+            .sortedByDescending { it.second }.take(topK).map { it.first }
+    }
+
+    // FALLBACK: Keyword Search (BM25-Lite)
+    fun searchKeyword(query: String, topK: Int = 3): List<String> {
+        val queryWords = query.lowercase().split(" ").filter { it.length > 3 }.toSet()
+        if (queryWords.isEmpty()) return records.take(topK).map { it.text }
+        
+        return records.map { record ->
+            val recordText = record.text.lowercase()
+            val score = queryWords.count { recordText.contains(it) }
+            record.text to score
+        }.filter { it.second > 0 }
+            .sortedByDescending { it.second }.take(topK).map { it.first }
     }
 
     private fun cosineSimilarity(a: FloatArray, b: FloatArray): Float {
-        var dotProduct = 0f
-        var normA = 0f
-        var normB = 0f
-        for (i in a.indices) {
-            dotProduct += a[i] * b[i]
-            normA += a[i] * a[i]
-            normB += b[i] * b[i]
-        }
-        val result = dotProduct / (kotlin.math.sqrt(normA) * kotlin.math.sqrt(normB))
-        return if (result.isNaN()) 0f else result
+        var dot = 0f; var nA = 0f; var nB = 0f
+        for (i in a.indices) { dot += a[i] * b[i]; nA += a[i] * a[i]; nB += b[i] * b[i] }
+        val res = dot / (kotlin.math.sqrt(nA) * kotlin.math.sqrt(nB))
+        return if (res.isNaN()) 0f else res
     }
-
     fun clear() = records.clear()
 }
 
-/**
- * VIEWMODEL
- */
 class ChatViewModel : ViewModel() {
     private val _messages = MutableStateFlow<List<ChatMessage>>(emptyList())
     val messages: StateFlow<List<ChatMessage>> = _messages.asStateFlow()
-
     private val _modelState = MutableStateFlow(ModelState.CHECKING)
     val modelState: StateFlow<ModelState> = _modelState.asStateFlow()
-
     private val _errorMessage = MutableStateFlow("")
     val errorMessage: StateFlow<String> = _errorMessage.asStateFlow()
 
@@ -153,9 +126,9 @@ class ChatViewModel : ViewModel() {
     private var mainConversation: Conversation? = null
     private var textEmbedder: TextEmbedder? = null
     private val vectorDB = LocalVectorDB()
-
-    // CRITICAL: Prevent Garbage Collection of the model buffer during operation
-    private var embeddingBuffer: ByteBuffer? = null
+    
+    // Safety flag
+    private var useKeywordFallback = false
 
     fun checkState(context: Context) {
         viewModelScope.launch(Dispatchers.IO) {
@@ -168,14 +141,9 @@ class ChatViewModel : ViewModel() {
                 !embed.exists() -> _modelState.value = ModelState.NEEDS_EMBEDDING_MODEL
                 !faiss.exists() -> _modelState.value = ModelState.NEEDS_FAISS_DB
                 else -> {
-                    try {
-                        _modelState.value = ModelState.LOADING_DB
-                        vectorDB.loadFromFile(faiss)
-                        initializeEngines(context, main.absolutePath, embed.absolutePath)
-                    } catch (t: Throwable) {
-                        _errorMessage.value = t.message ?: "Initialization Failed"
-                        _modelState.value = ModelState.ERROR
-                    }
+                    _modelState.value = ModelState.LOADING_DB
+                    vectorDB.loadFromFile(faiss)
+                    initializeEngines(context, main.absolutePath, embed.absolutePath)
                 }
             }
         }
@@ -186,166 +154,110 @@ class ChatViewModel : ViewModel() {
             _modelState.value = ModelState.COPYING
             try {
                 context.contentResolver.openInputStream(uri)?.use { input ->
-                    FileOutputStream(File(context.filesDir, name)).use { input.copyTo(it) }
+                    FileOutputStream(File(context.filesDir, name)).use { it.write(input.readBytes()) }
                 }
                 checkState(context)
             } catch (t: Throwable) {
-                _errorMessage.value = "Copy Failed: ${t.message}"
-                _modelState.value = ModelState.ERROR
+                _errorMessage.value = "Copy Error: ${t.message}"; _modelState.value = ModelState.ERROR
             }
         }
     }
 
     private fun initializeEngines(context: Context, mainPath: String, embedPath: String) {
-        // 1. Initialize Generative Engine (Gemma 1B/2B)
         try {
+            // 1. Initialize Gemma
             Engine.setNativeMinLogSeverity(LogSeverity.ERROR)
             mainEngine = Engine(EngineConfig(modelPath = mainPath))
             mainEngine?.initialize()
             mainConversation = mainEngine?.createConversation()
-        } catch (e: Exception) {
-            throw Exception("Main Engine Error: ${e.message}")
-        }
 
-        // 2. Initialize Embedding Engine (Embedding Gemma 300M)
-        try {
-            val file = File(embedPath)
-            val inputStream = FileInputStream(file)
-            val channel = inputStream.channel
-            
-            // NON-NEGOTIABLE FIX: Load to Direct ByteBuffer to bypass mmap allocation limits
-            embeddingBuffer = ByteBuffer.allocateDirect(file.length().toInt()).apply {
-                order(ByteOrder.nativeOrder())
-                channel.read(this)
-                flip()
+            // 2. Initialize Embedder with Fallback
+            try {
+                val pfd = ParcelFileDescriptor.open(File(embedPath), ParcelFileDescriptor.MODE_READ_ONLY)
+                val options = TextEmbedder.TextEmbedderOptions.builder()
+                    .setBaseOptions(BaseOptions.builder().setModelAssetFileDescriptor(pfd.fd).build())
+                    .build()
+                textEmbedder = TextEmbedder.createFromOptions(context, options)
+                useKeywordFallback = false
+            } catch (e: Exception) {
+                Log.e("AI", "Embedder failed, falling back to keywords", e)
+                useKeywordFallback = true
             }
-            channel.close()
-            inputStream.close()
 
-            val baseOptions = BaseOptions.builder()
-                .setModelAssetBuffer(embeddingBuffer)
-                .build()
-                
-            val options = TextEmbedder.TextEmbedderOptions.builder()
-                .setBaseOptions(baseOptions)
-                .build()
-            
-            textEmbedder = TextEmbedder.createFromOptions(context, options)
-
-            _messages.value = listOf(ChatMessage(text = "System Ready. Agentic RAG Active.", isFromUser = false))
+            val statusText = if (useKeywordFallback) "Ready (Keyword Search Mode)" else "Ready (Neural Search Mode)"
+            _messages.value = listOf(ChatMessage(text = statusText, isFromUser = false))
             _modelState.value = ModelState.READY
         } catch (e: Exception) {
-            throw Exception("Embedding Engine Error: ${e.message}")
+            _errorMessage.value = "Engine Error: ${e.message}"; _modelState.value = ModelState.ERROR
         }
     }
 
     fun sendMessage(prompt: String) {
         if (prompt.isBlank()) return
         _messages.value += ChatMessage(text = prompt, isFromUser = true)
-        
         val botMsgId = UUID.randomUUID().toString()
         _messages.value += ChatMessage(id = botMsgId, text = "", isFromUser = false, isLoading = true)
 
         viewModelScope.launch(Dispatchers.IO) {
             try {
-                updateBotStatus(botMsgId, "Agent analyzing query...", true)
-                
-                val routePrompt = "SYSTEM: Reply RAG_REQUIRED if this query needs facts, else reply DIRECT. USER: $prompt"
-                val decision = querySync(routePrompt)
+                updateBotStatus(botMsgId, "Thinking...", true)
+                val decision = querySync("SYSTEM: Reply RAG_REQUIRED if the user asks for facts or data, else reply DIRECT. USER: $prompt")
 
                 if (decision.contains("RAG_REQUIRED", ignoreCase = true)) {
-                    updateBotStatus(botMsgId, "Retrieving context from Vector DB...", true)
-                    val vector = generateEmbed(prompt)
-                    val contextList = vectorDB.search(vector)
-                    val contextString = contextList.joinToString("\n---\n")
+                    updateBotStatus(botMsgId, "Retrieving Local Context...", true)
+                    
+                    val contextList = if (useKeywordFallback || textEmbedder == null) {
+                        vectorDB.searchKeyword(prompt)
+                    } else {
+                        try {
+                            val vector = textEmbedder!!.embed(prompt).embeddingResult().embeddings().first().floatEmbedding()
+                            vectorDB.searchVector(vector)
+                        } catch (e: Exception) { vectorDB.searchKeyword(prompt) }
+                    }
 
-                    updateBotStatus(botMsgId, "Generating answer with RAG...", true)
-                    val finalPrompt = "CONTEXT: $contextString\nUSER: $prompt"
-                    streamResponse(botMsgId, finalPrompt)
+                    val contextString = if(contextList.isEmpty()) "No local data found." else contextList.joinToString("\n---\n")
+                    streamResponse(botMsgId, "CONTEXT FROM LOCAL FILES:\n$contextString\n\nUSER QUESTION: $prompt")
                 } else {
-                    updateBotStatus(botMsgId, "Generating direct answer...", true)
                     streamResponse(botMsgId, prompt)
                 }
-            } catch (e: Exception) {
-                updateBotStatus(botMsgId, "Pipeline Error: ${e.message}", false)
-            }
+            } catch (e: Exception) { updateBotStatus(botMsgId, "Pipeline Error: ${e.message}", false) }
         }
     }
 
     private suspend fun querySync(p: String): String {
-        val conv = mainEngine?.createConversation() ?: return ""
-        var result = ""
-        try {
-            conv.sendMessageAsync(p).collect { result += it }
-        } finally {
-            conv.close()
-        }
-        return result.trim()
+        val conv = mainEngine?.createConversation() ?: return "DIRECT"
+        var res = ""
+        try { conv.sendMessageAsync(p).collect { res += it } } finally { conv.close() }
+        return res
     }
 
     private suspend fun streamResponse(msgId: String, p: String) {
-        var fullText = ""
-        mainConversation?.sendMessageAsync(p)?.collect { token ->
-            fullText += token
-            updateBotStatus(msgId, fullText, true)
-        }
-        updateBotStatus(msgId, fullText, false)
-    }
-
-    private fun generateEmbed(text: String): FloatArray {
-        val embedder = textEmbedder ?: throw Exception("Embedder is null")
-        val results = embedder.embed(text)
-        return results.embeddingResult().embeddings().first().floatEmbedding()
+        var full = ""
+        mainConversation?.sendMessageAsync(p)?.collect { full += it; updateBotStatus(msgId, full, true) }
+        updateBotStatus(msgId, full, false)
     }
 
     private fun updateBotStatus(id: String, text: String, loading: Boolean) {
-        val currentList = _messages.value.toMutableList()
-        val index = currentList.indexOfFirst { it.id == id }
-        if (index != -1) {
-            currentList[index] = currentList[index].copy(text = text, isLoading = loading)
-            _messages.value = currentList
-        }
+        val list = _messages.value.toMutableList()
+        val i = list.indexOfFirst { it.id == id }
+        if (i != -1) { list[i] = list[i].copy(text = text, isLoading = loading); _messages.value = list }
     }
 
     fun reset(context: Context) {
         viewModelScope.launch(Dispatchers.IO) {
-            try { mainConversation?.close() } catch (e: Exception) {}
-            try { mainEngine?.close() } catch (e: Exception) {}
-            try { textEmbedder?.close() } catch (e: Exception) {}
-            embeddingBuffer = null
-            
+            mainConversation?.close(); mainEngine?.close(); textEmbedder?.close()
             File(context.filesDir, "main_model.litertlm").delete()
             File(context.filesDir, "embedding_model.litertlm").delete()
             File(context.filesDir, "faiss_db.json").delete()
-            vectorDB.clear()
-            _messages.value = emptyList()
-            _modelState.value = ModelState.CHECKING
-            checkState(context)
+            _messages.value = emptyList(); _modelState.value = ModelState.CHECKING; checkState(context)
         }
-    }
-
-    override fun onCleared() {
-        super.onCleared()
-        mainConversation?.close()
-        mainEngine?.close()
-        textEmbedder?.close()
-        embeddingBuffer = null
     }
 }
 
-/**
- * UI COMPONENTS
- */
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        setContent {
-            AppTheme {
-                Surface(modifier = Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
-                    MainScreen()
-                }
-            }
-        }
+        setContent { AppTheme { Surface(Modifier.fillMaxSize()) { MainScreen() } } }
     }
 }
 
@@ -364,31 +276,19 @@ fun MainScreen(viewModel: ChatViewModel = viewModel()) {
     val p3 = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { it?.let { viewModel.copyFile(context, it, "faiss_db.json") } }
 
     Scaffold(
-        topBar = {
-            TopAppBar(
-                title = { Text("Local Agentic RAG", fontWeight = FontWeight.Bold) },
-                actions = {
-                    if (state == ModelState.READY) {
-                        Button(onClick = { viewModel.reset(context) }) { Text("Reset") }
-                    }
-                }
-            )
-        },
-        bottomBar = {
-            if (state == ModelState.READY) {
-                ChatInputBar { viewModel.sendMessage(it) }
-            }
-        }
+        topBar = { TopAppBar(title = { Text("Agentic RAG", fontWeight = FontWeight.Bold) }, 
+            actions = { if(state == ModelState.READY) IconButton(onClick={viewModel.reset(context)}){ Text("Reset", color=Color.Red) } }) },
+        bottomBar = { if(state == ModelState.READY) ChatInputBar { viewModel.sendMessage(it) } }
     ) { padding ->
         Box(Modifier.padding(padding).fillMaxSize()) {
-            when (state) {
-                ModelState.CHECKING -> LoadingUI("Scanning storage...")
-                ModelState.NEEDS_MAIN_MODEL -> SetupUI("1. Main Model Required", "Select Gemma-1B/2B (.bin)") { p1.launch(arrayOf("*/*")) }
-                ModelState.NEEDS_EMBEDDING_MODEL -> SetupUI("2. Embedding Model Required", "Select Embedding-300M (.tflite)") { p2.launch(arrayOf("*/*")) }
-                ModelState.NEEDS_FAISS_DB -> SetupUI("3. Vector DB Required", "Select faiss_db.json") { p3.launch(arrayOf("*/*")) }
-                ModelState.COPYING -> LoadingUI("Copying files to app sandbox...")
-                ModelState.LOADING_DB -> LoadingUI("Loading Vector DB...")
-                ModelState.ERROR -> SetupUI("Error:\n$error", "Reset & Try Again") { viewModel.reset(context) }
+            when(state) {
+                ModelState.CHECKING -> LoadingUI("Checking Storage...")
+                ModelState.NEEDS_MAIN_MODEL -> SetupUI("1. Gemma-1B/2B Required", "Select .bin File") { p1.launch(arrayOf("*/*")) }
+                ModelState.NEEDS_EMBEDDING_MODEL -> SetupUI("2. Embedding Model Required", "Select .tflite File") { p2.launch(arrayOf("*/*")) }
+                ModelState.NEEDS_FAISS_DB -> SetupUI("3. Knowledge Base Required", "Select .json File") { p3.launch(arrayOf("*/*")) }
+                ModelState.COPYING -> LoadingUI("Securing Models...")
+                ModelState.LOADING_DB -> LoadingUI("Warming up Engines...")
+                ModelState.ERROR -> SetupUI("Critical Error:\n$error", "Full Reset") { viewModel.reset(context) }
                 ModelState.READY -> ChatList(messages)
             }
         }
@@ -397,19 +297,13 @@ fun MainScreen(viewModel: ChatViewModel = viewModel()) {
 
 @Composable
 fun LoadingUI(m: String) {
-    Column(Modifier.fillMaxSize(), Arrangement.Center, Alignment.CenterHorizontally) {
-        CircularProgressIndicator()
-        Spacer(Modifier.height(16.dp))
-        Text(m)
-    }
+    Column(Modifier.fillMaxSize(), Arrangement.Center, Alignment.CenterHorizontally) { CircularProgressIndicator(); Spacer(Modifier.height(16.dp)); Text(m) }
 }
 
 @Composable
 fun SetupUI(t: String, b: String, onClick: () -> Unit) {
     Column(Modifier.fillMaxSize().padding(32.dp), Arrangement.Center, Alignment.CenterHorizontally) {
-        Text(t, style = MaterialTheme.typography.headlineSmall, textAlign = TextAlign.Center)
-        Spacer(Modifier.height(24.dp))
-        Button(onClick, Modifier.fillMaxWidth().height(56.dp)) { Text(b) }
+        Text(t, style = MaterialTheme.typography.headlineSmall); Spacer(Modifier.height(20.dp)); Button(onClick) { Text(b) }
     }
 }
 
@@ -418,17 +312,14 @@ fun ChatList(msgs: List<ChatMessage>) {
     val listState = rememberLazyListState()
     LaunchedEffect(msgs.size) { if(msgs.isNotEmpty()) listState.animateScrollToItem(msgs.lastIndex) }
     LazyColumn(state = listState, modifier = Modifier.fillMaxSize(), contentPadding = PaddingValues(16.dp)) {
-        items(msgs) { ChatBubble(it) }
-    }
-}
-
-@Composable
-fun ChatBubble(msg: ChatMessage) {
-    val align = if (msg.isFromUser) Alignment.CenterEnd else Alignment.CenterStart
-    val color = if (msg.isFromUser) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.surfaceVariant
-    Box(Modifier.fillMaxWidth().padding(vertical = 4.dp), contentAlignment = align) {
-        Surface(color = color, shape = RoundedCornerShape(12.dp)) {
-            Text(msg.text + (if(msg.isLoading) "..." else ""), Modifier.padding(12.dp))
+        items(msgs) { msg ->
+            val align = if (msg.isFromUser) Alignment.CenterEnd else Alignment.CenterStart
+            val color = if (msg.isFromUser) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.surfaceVariant
+            Box(Modifier.fillMaxWidth().padding(4.dp), contentAlignment = align) {
+                Surface(color = color, shape = RoundedCornerShape(12.dp)) {
+                    Text(msg.text + (if(msg.isLoading) "..." else ""), Modifier.padding(12.dp))
+                }
+            }
         }
     }
 }
@@ -438,7 +329,6 @@ fun ChatInputBar(onSend: (String) -> Unit) {
     var text by remember { mutableStateOf("") }
     Row(Modifier.fillMaxWidth().padding(8.dp), verticalAlignment = Alignment.CenterVertically) {
         OutlinedTextField(text, { text = it }, Modifier.weight(1f), shape = RoundedCornerShape(24.dp))
-        Spacer(Modifier.width(8.dp))
         IconButton(onClick = { if(text.isNotBlank()){ onSend(text); text="" } }) { Icon(Icons.Default.Send, null) }
     }
 }
