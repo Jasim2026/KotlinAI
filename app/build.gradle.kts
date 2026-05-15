@@ -23,7 +23,6 @@ android {
         }
     }
     
-    // LiteRT-LM requires Java 21 (Class file version 65.0)
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_21
         targetCompatibility = JavaVersion.VERSION_21
@@ -66,10 +65,9 @@ dependencies {
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.8.1")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
     
-    // DocumentFile for Storage Access Framework (SAF) folder picking
-    implementation("androidx.documentfile:documentfile:1.0.1")
-    
-    // Official Google LiteRT-LM dependency (Latest Stable)
+    // Official Google LiteRT-LM dependency (for Generative Model)
     implementation("com.google.ai.edge.litertlm:litertlm-android:0.11.0") 
+    
+    // TFLite Task Library (for Embedding Model) - THIS LINE FIXES THE BUILD
     implementation("org.tensorflow:tensorflow-lite-task-text:0.4.4")
 }

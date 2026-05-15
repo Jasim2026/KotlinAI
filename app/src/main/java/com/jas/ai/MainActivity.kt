@@ -75,8 +75,6 @@ class LocalVectorDB {
             throw IllegalArgumentException("faiss_db.json not found in internal storage.")
         }
 
-        // Use JsonReader to stream the massive file chunk-by-chunk 
-        // avoiding OutOfMemoryError (OOM) crashes.
         JsonReader(FileReader(dbFile)).use { reader ->
             reader.beginArray()
             while (reader.hasNext()) {
@@ -144,8 +142,6 @@ class ChatViewModel : ViewModel() {
 
     private var mainEngine: Engine? = null
     private var mainConversation: Conversation? = null
-    
-    // Using the correct TensorFlow Lite Task Library TextEmbedder for Embedding Models
     private var textEmbedder: TextEmbedder? = null
     
     private val vectorDB = LocalVectorDB()
@@ -205,18 +201,17 @@ class ChatViewModel : ViewModel() {
 
     private fun initializeEngines(mainPath: String, embedPath: String) {
         try {
-            // 1. Initialize Main LLM natively for Text Generation
             Engine.setNativeMinLogSeverity(LogSeverity.ERROR)
             mainEngine = Engine(EngineConfig(modelPath = mainPath))
             mainEngine?.initialize()
             mainConversation = mainEngine?.createConversation()
             
-            // 2. Initialize TextEmbedder natively for Dense Vector Embedding Extraction
             val baseOptions = BaseOptions.builder().build()
             val embedderOptions = TextEmbedder.TextEmbedderOptions.builder()
                 .setBaseOptions(baseOptions)
                 .build()
-                
+            
+            // CORRECTED: createFromFileAndOptions takes a File, not a Context
             textEmbedder = TextEmbedder.createFromFileAndOptions(File(embedPath), embedderOptions)
             
             _messages.value = listOf(
@@ -252,9 +247,11 @@ class ChatViewModel : ViewModel() {
                 val needsRag = routeResponse.contains("RAG_REQUIRED", ignoreCase = true)
 
                 if (needsRag) {
-                    updateLastBotMessage("Agent routing... Searching local Vector DB...", isLoading = true)
+                    updateLastBotMessage("Agent routing... Generating embedding...", isLoading = true)
                     
                     val queryEmbedding = generateEmbedding(text)
+                    
+                    updateLastBotMessage("Searching local Vector DB...", isLoading = true)
                     val contextTexts = vectorDB.search(queryEmbedding, topK = 3)
                     val combinedContext = contextTexts.joinToString("\n\n")
                     
@@ -301,7 +298,8 @@ class ChatViewModel : ViewModel() {
         val embedder = textEmbedder ?: throw IllegalStateException("TextEmbedder not initialized")
         val results = embedder.embed(text)
         
-        return results.embeddings.firstOrNull()?.floatArray 
+        // CORRECTED: The API call chain is results.embeddingResult().embeddings()
+        return results.embeddingResult().embeddings().firstOrNull()?.floatArray 
             ?: throw IllegalStateException("TextEmbedder failed to return a valid float array")
     }
 
@@ -445,6 +443,7 @@ fun MainScreen(viewModel: ChatViewModel = viewModel()) {
     }
 }
 
+// Keep all the Composable functions (LoadingScreen, ActionScreen, etc.) below this line as they were. They are correct.
 @Composable
 fun LoadingScreen(message: String) {
     Column(
